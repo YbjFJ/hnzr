@@ -1,0 +1,395 @@
+import asyncio
+from asyncio.log import logger
+import datetime
+import json
+import re
+from typing import Dict
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.output_parsers import JsonOutputParser # 新增：专用的JSON解析器
+from config import settings
+from tavily import TavilyClient
+import httpx
+# ================= 全局 AI 实例缓存 =================
+
+_global_llm = None
+_global_embeddings = None
+
+
+def get_llm():
+    """获取全局唯一的 LLM 实例 (懒加载)"""
+    global _global_llm
+    if _global_llm is None:
+        print("⚡ [系统]: 初始化 LLM 单例对象...")
+        _global_llm = ChatOpenAI(
+            model='doubao-1-5-pro-32k-250115',
+            openai_api_key=settings.doubao_api_key,
+            openai_api_base='https://ark.cn-beijing.volces.com/api/v3',
+            streaming=True,
+            temperature=0.3
+        )
+    return _global_llm
+
+
+def get_embeddings():
+    """获取全局唯一的 Embeddings 实例 (懒加载)"""
+    global _global_embeddings
+    if _global_embeddings is None:
+        print("⚡ [系统]: 初始化 Embeddings 单例对象...")
+        _global_embeddings = OpenAIEmbeddings(
+            model='ep-20250517101556-hq2sg',
+            openai_api_key=settings.doubao_api_key,
+            openai_api_base='https://ark.cn-beijing.volces.com/api/v3',
+            check_embedding_ctx_length=False
+        )
+        
+    return _global_embeddings
+
+
+def build_vectorstore_from_articles(articles):
+    """
+    从文章列表构建向量数据库
+    """
+    # 将文章转换为 Document 对象
+    docs = []
+    for article in articles:
+        # 构建文章内容，包含标题、摘要和正文
+        content = f"标题: {article.title}\n"
+        if article.summary:
+            content += f"摘要: {article.summary}\n"
+        content += f"内容: {article.content}"
+        
+        # 确保内容是字符串类型
+        content = str(content) if content else ""
+        
+        # 添加元数据
+        metadata = {
+            "article_id": article.id,
+            "title": article.title,
+            "publish_date": article.publish_date,
+            "type": article.type,
+            "source_name": article.source_name
+        }
+        
+        doc = Document(page_content=content, metadata=metadata)
+        docs.append(doc)
+    
+    # 分割文档，优化检索效果
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=600,
+        chunk_overlap=60,
+        separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", "\s"]
+    )
+    splits = text_splitter.split_documents(docs)
+    
+    # 确保分割后的内容都是字符串
+    for i, split in enumerate(splits):
+        if not isinstance(split.page_content, str):
+            splits[i].page_content = str(split.page_content) if split.page_content else ""
+    
+    # 提取文本列表和元数据列表
+    texts = [split.page_content for split in splits]
+    metadatas = [split.metadata for split in splits]
+    
+    # 过滤掉空文本
+    texts_with_metadata = [(text, meta) for text, meta in zip(texts, metadatas) if text.strip()]
+    if not texts_with_metadata:
+        return None
+    
+    filtered_texts, filtered_metadatas = zip(*texts_with_metadata)
+    
+    # 构建向量数据库
+    embeddings = get_embeddings()
+    vectorstore = FAISS.from_texts(
+        texts=list(filtered_texts),
+        embedding=embeddings,
+        metadatas=list(filtered_metadatas)
+    )
+    
+    return vectorstore
+
+
+def retrieve_relevant_content(query, articles, k=3):
+    """
+    从文章列表中检索与查询相关的内容
+    """
+    if not articles:
+        return []
+    
+    # 构建向量数据库
+    vectorstore = build_vectorstore_from_articles(articles)
+    
+    # 处理向量数据库构建失败的情况
+    if not vectorstore:
+        return []
+    
+    # 相似度搜索，获取最相关的内容
+    retrieved_docs = vectorstore.similarity_search(query, k=k)
+    
+    return retrieved_docs
+
+
+async def web_search_bocha(query: str, max_results: int = 5, days: int = 7) -> Dict:
+    """
+    使用 Bocha (博查) 搜索引擎，专注于中文政策和新闻
+    """
+    # 你的博查 API Key (建议放入 settings 或环境变量)
+    BOCHA_API_KEY = settings.BOCHA_API_KEY 
+    API_URL = "https://api.bochaai.com/v1/web-search"
+
+    # === 搜索词优化策略 ===
+    # 为了尊重原文，我们给用户的关键词自动加上后缀
+    # 这样能极大提高搜到政府官网(.gov.cn)的概率
+    optimized_query = f"{query} 政策原文 site:gov.cn" 
+    # 或者用更宽泛的: optimized_query = f"{query} 政策发布"
+
+    headers = {
+        "Authorization": f"Bearer {BOCHA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Bocha 的时间参数通常是 'oneDay', 'oneWeek', 'oneMonth', 'oneYear', 'noLimit'
+    freshness = "noLimit"
+    if days <= 1: freshness = "oneDay"
+    elif days <= 7: freshness = "oneWeek"
+    elif days <= 30: freshness = "oneMonth"
+    elif days <= 365: freshness = "oneYear"
+
+    payload = {
+        "query": optimized_query,
+        "freshness": freshness, 
+        "summary": True,      # 让博查生成摘要
+        "count": max_results
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(API_URL, headers=headers, json=payload, timeout=30.0)
+            
+            if resp.status_code != 200:
+                logger.error(f"Bocha 搜索 API 错误: {resp.text}")
+                return {"results": []}
+
+            data = resp.json()
+            
+            # 格式化为与你之前代码兼容的格式
+            # Bocha 返回结构通常在 data['data']['webPages']['value'] 中
+            formatted_results = []
+            
+            # 注意：Bocha 的返回结构可能会更新，请参考最新文档
+            # 假设结构为 data['data'] 是列表
+            raw_results = data.get("data", {}).get("webPages", {}).get("value", [])
+            
+            for item in raw_results:
+                formatted_results.append({
+                    "title": item.get("name") or item.get("title"),
+                    "url": item.get("url"),
+                    "content": item.get("snippet") or item.get("summary", ""),
+                    "published_date": item.get("dateLastCrawled") or "近期" # Bocha 可能不直接返回 publish_date，用抓取时间代替
+                })
+
+            return {"results": formatted_results}
+
+    except Exception as e:
+        logger.error(f"Bocha 搜索异常: {str(e)}")
+        return {"results": []}
+    
+
+async def web_search_travily(query: str, max_results: int = 5, days: int = 7) -> Dict:
+    """
+    异步执行 Tavily 网络搜索，专注于近期新闻
+    :param days: 搜索过去多少天的数据 (默认3天)
+    """
+    tavily = TavilyClient(api_key=settings.TAVILY_API_KEY)
+    
+    try:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: tavily.search(
+                query=query,
+                search_depth="advanced",
+                topic="news",           # <--- 关键：指定搜索新闻主题
+                days=days,              # <--- 关键：限制过去 N 天
+                max_results=max_results,
+                include_answer=True,
+                include_raw_content=False,
+                include_images=False
+            )
+        )
+        return response
+    except Exception as e:
+        logger.error(f"Tavily 搜索失败: {str(e)}")
+        return {"results": []}
+
+# 1. 新增：抓取网页正文的辅助函数
+async def fetch_url_content(url: str) -> str:
+    """
+    使用 Jina Reader 将网页转换为对 LLM 友好的 Markdown
+    """
+    jina_url = f"https://r.jina.ai/{url}"
+    
+    # 可以在 header 中加 Authorization 使用免费 API Key 提高额度，
+    # 不加 key 也有免费额度，通常够用
+    headers = {
+        # "Authorization": "Bearer YOUR_JINA_API_KEY", 
+        "X-Return-Format": "markdown"
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(jina_url, headers=headers)
+            if resp.status_code == 200:
+                # 截取前 8000 字符，防止 token 爆炸
+                return resp.text[:8000]
+            else:
+                return ""
+    except Exception as e:
+        logger.warning(f"抓取网页失败 {url}: {e}")
+        return ""
+
+async def generate_article_from_search(query: str):
+    """
+    根据搜索结果生成新闻咨询（修复URL丢失版）
+    """
+    # 1. 获取当前日期
+    today_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 2. 异步执行搜索
+    logger.info(f"正在搜索关键词: {query}")
+    search_response = await web_search_bocha(query, max_results=5, days=7) 
+    results = search_response.get("results", [])
+
+    # === 关键点：这里提取了 URL，要在最后返回出去 ===
+    source_urls_list = [res.get('url') for res in results if res.get('url')]
+    
+    if not results:
+        logger.warning("未找到相关搜索结果")
+        return None
+
+    # 3. 构建上下文
+    context_text = ""
+    for idx, res in enumerate(results, 1):
+        # 提取发布时间，如果没有则显示未知
+        pub_date = res.get('published_date', '未知日期')
+        
+        context_text += f"[{idx}] 标题: {res.get('title')}\n"
+        context_text += f"    时间: {pub_date}\n" # <--- 把日期告诉 AI
+        context_text += f"    链接: {res.get('url')} \n"
+        context_text += f"    摘要: {res.get('content')}\n\n"
+
+
+    # 4. 初始化 LangChain 解析器
+    parser = JsonOutputParser()
+    format_instructions = parser.get_format_instructions()
+
+    # 5. 构建 Prompt
+    system_prompt = f"""你是一名政府政策档案整理员，专注于中国政策内容的精确还原。今天是 {today_date}。
+
+任务目标：根据提供的搜索结果（主要是政府官网或权威媒体报道），整理一篇关于“{query}”的政策原文档案。
+
+**绝对禁令：**
+1. ❌ **禁止瞎编**：如果搜索结果里没有具体条款，就说没有，不要自己造。
+2. ❌ **禁止解读**：不要出现“该政策意味着...”、“利好...”等分析性语言。
+3. ❌ **禁止口语**：保持公文的严肃性。
+
+**内容要求：**
+1. **标题**：使用官方发布的标准文件标题（如果能找到）。
+2. **发布信息**：明确列出发布机构（如农业农村部、财政部）、发布文号（如农计发〔202X〕X号）、发布时间。
+3. **正文**：
+   - 必须尽可能保留原文的条款结构（如 一、二、三... (一)(二)...）。
+   - 如果原文太长，可以只摘录核心条款，但摘录的文字必须与原文一致，**不能进行同义词替换**。
+   - 重点关注：具体的补贴金额、实施范围、申请条件、截止日期。
+
+{format_instructions}
+"""
+
+    user_prompt = f"""搜索关键词："{query}"
+
+搜索结果数据：
+{context_text}
+
+请生成文章（JSON格式）："""
+
+    # 6. 调用 AI
+    llm = get_llm()
+    
+    try:
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        ai_response = await llm.ainvoke(messages)
+        response_text = ai_response.content.strip()
+
+        # --- 解析阶段 (三层保险) ---
+
+        # 第一层：LangChain 专用解析器
+        try:
+            article_data = parser.parse(response_text)
+            # === 修复：传入 source_urls_list ===
+            return validate_and_fix_data(article_data, source_urls_list)
+        except Exception:
+            logger.warning("LangChain Parser 解析失败，尝试手动清洗...")
+
+        # 第二层：手动清洗 + json.loads
+        clean_text = re.sub(r'^```json\s*', '', response_text, flags=re.MULTILINE)
+        clean_text = re.sub(r'^```\s*', '', clean_text, flags=re.MULTILINE)
+        clean_text = clean_text.strip().rstrip('`')
+        
+        try:
+            article_data = json.loads(clean_text)
+            # === 修复：传入 source_urls_list ===
+            return validate_and_fix_data(article_data, source_urls_list)
+        except json.JSONDecodeError:
+            logger.warning("标准 JSON 解析失败，进入正则强制提取模式...")
+
+        # 第三层：正则强制提取 (兜底)
+        title_match = re.search(r'"title"\s*:\s*"(.*?)"', response_text)
+        summary_match = re.search(r'"summary"\s*:\s*"(.*?)"', response_text)
+        content_match = re.search(r'"content"\s*:\s*"(.*)"\s*\}', response_text, re.DOTALL)
+        
+        if not content_match:
+             content_match = re.search(r'"content"\s*:\s*"(.*)', response_text, re.DOTALL)
+
+        if title_match and content_match:
+            title = title_match.group(1)
+            content = content_match.group(1).rstrip('"').rstrip().rstrip('}')
+            summary = summary_match.group(1) if summary_match else content[:100]
+            
+            content = content.replace('\\n', '\n').replace('\\"', '"')
+            
+            return {
+                "title": title,
+                "summary": summary,
+                "content": content,
+                "source_urls": source_urls_list  # 这里你之前已经写对了
+            }
+            
+        raise Exception("无法从 AI 响应中提取有效数据")
+
+    except Exception as e:
+        logger.error(f"文章生成全流程失败: {str(e)}")
+        # 调试时很有用
+        # logger.error(f"原始响应: {response_text}") 
+        return None
+
+# === 修改后的辅助函数 ===
+def validate_and_fix_data(data, source_urls):
+    """
+    辅助函数：确保数据结构完整，并注入 URL 列表
+    """
+    if not isinstance(data, dict):
+        return None
+    
+    return {
+        "title": data.get("title", "未命名文章"),
+        "summary": data.get("summary", "暂无摘要"),
+        "content": data.get("content", ""),
+        # 这里强制使用我们要保存的真实 URL 列表
+        "source_urls": source_urls 
+    }
